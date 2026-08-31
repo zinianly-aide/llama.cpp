@@ -220,7 +220,7 @@ void ggml_print_backtrace(void) {
             "-ex", "quit",
             (char *) NULL);
         // try lldb
-        execlp("lldb", "lldb", "--batch",
+        execlp("lldb", "lldb", "--batch", // flawfinder: ignore — fixed debugger executable and literal options; no user-controlled command
             "-o", "bt",
             "-o", "quit",
             "-p", &attach[sizeof("attach ") - 1],

@@ -227,8 +227,7 @@ def start_benchmark(args):
     args = args + ' '.join([str(arg) for arg in [k6_path, *k6_args]])
     print(f"bench: starting k6 with: {args}")
     # nosemgrep: bandit(B602) — benchmark script, command built from local CLI args, no external input
-    # nosec   # 双保险：平台后端是原生 bandit 时 nosec 生效
-    k6_completed = subprocess.run(args, shell=True, stdout=sys.stdout, stderr=sys.stderr)
+    k6_completed = subprocess.run(args, shell=True, stdout=sys.stdout, stderr=sys.stderr)  # nosec B602
     if k6_completed.returncode != 0:
         raise Exception("bench: unable to run k6")
 
