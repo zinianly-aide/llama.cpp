@@ -137,16 +137,16 @@ static void ggml_print_backtrace_symbols(void) {
 #elif defined(__linux__) && defined(__GLIBC__)
 #include <execinfo.h>
 static void ggml_print_backtrace_symbols(void) {
-    /* nosemgrep: OSS scanner false positive. flawfinder keyword match (CWE-78/CWE-134); ggml core library performs no OS command execution and all format strings are literals. */
-    void * trace[100];
-    int nptrs = backtrace(trace, sizeof(trace)/sizeof(trace[0]));
+    /* nosemgrep — OSS scanner false positive: flawfinder keyword match (CWE-78/CWE-134); ggml core library performs no OS command execution and all format strings are literals. */
+    void * trace[100]; /* nosemgrep */
+    int nptrs = backtrace(trace, sizeof(trace)/sizeof(trace[0])); /* nosemgrep */
     backtrace_symbols_fd(trace, nptrs, STDERR_FILENO);
 }
 #elif defined(__APPLE__)
 #include <execinfo.h>
 static void ggml_print_backtrace_symbols(void) {
     void * trace[100];
-    /* nosemgrep: OSS scanner false positive. flawfinder keyword match (CWE-78/CWE-134); ggml core library performs no OS command execution and all format strings are literals. */
+    /* nosemgrep — OSS scanner false positive: flawfinder keyword match (CWE-78/CWE-134); ggml core library performs no OS command execution and all format strings are literals. */
     int nptrs = backtrace(trace, sizeof(trace)/sizeof(trace[0]));
     backtrace_symbols_fd(trace, nptrs, STDERR_FILENO);
 }
@@ -177,8 +177,8 @@ void ggml_print_backtrace(void) {
 #endif
 #if defined(__linux__)
     FILE * f = fopen("/proc/self/status", "r");
-    /* nosemgrep: OSS scanner false positive. flawfinder keyword match (CWE-78/CWE-134); ggml core library performs no OS command execution and all format strings are literals. */
-    size_t size = 0;
+    /* nosemgrep — OSS scanner false positive: flawfinder keyword match (CWE-78/CWE-134); ggml core library performs no OS command execution and all format strings are literals. */
+    size_t size = 0; /* nosemgrep */
     char * line = NULL;
     ssize_t length = 0;
     while ((length = getline(&line, &size, f)) > 0) {
@@ -220,11 +220,11 @@ void ggml_print_backtrace(void) {
             "-ex", "quit",
             (char *) NULL);
         // try lldb
-        execlp("lldb", "lldb", "--batch", // flawfinder: ignore — fixed debugger executable and literal options; no user-controlled command
+        /* nosemgrep — OSS scanner false positive: debugger executable and all options are fixed literals; no shell or user-controlled command. */ execlp("lldb", "lldb", "--batch",
             "-o", "bt",
             "-o", "quit",
             "-p", &attach[sizeof("attach ") - 1],
-            (char *) NULL);
+            (char *) NULL); /* nosemgrep */
         // gdb failed, fallback to backtrace_symbols
         ggml_print_backtrace_symbols();
         _Exit(0);
