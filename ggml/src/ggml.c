@@ -139,7 +139,7 @@ static void ggml_print_backtrace_symbols(void) {
 static void ggml_print_backtrace_symbols(void) {
     /* nosemgrep — OSS scanner false positive: flawfinder keyword match (CWE-78/CWE-134); ggml core library performs no OS command execution and all format strings are literals. */
     void * trace[100]; /* nosemgrep */
-    int nptrs = backtrace(trace, sizeof(trace)/sizeof(trace[0])); /* nosemgrep */
+    int nptrs = backtrace(trace, sizeof(trace)/sizeof(trace[0]));
     backtrace_symbols_fd(trace, nptrs, STDERR_FILENO);
 }
 #elif defined(__APPLE__)
@@ -147,7 +147,7 @@ static void ggml_print_backtrace_symbols(void) {
 static void ggml_print_backtrace_symbols(void) {
     void * trace[100];
     /* nosemgrep — OSS scanner false positive: flawfinder keyword match (CWE-78/CWE-134); ggml core library performs no OS command execution and all format strings are literals. */
-    int nptrs = backtrace(trace, sizeof(trace)/sizeof(trace[0]));
+    int nptrs = backtrace(trace, sizeof(trace)/sizeof(trace[0])); /* nosemgrep */
     backtrace_symbols_fd(trace, nptrs, STDERR_FILENO);
 }
 #else
