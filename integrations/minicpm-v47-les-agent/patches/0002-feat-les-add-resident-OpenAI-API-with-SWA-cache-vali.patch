@@ -1,0 +1,205 @@
+From dec8e32e8a8f4c80fc8712cd97894806bad2e608 Mon Sep 17 00:00:00 2001
+From: GitHub Bot <bot@example.com>
+Date: Wed, 14 Oct 2026 08:40:02 +0800
+Subject: [PATCH 2/3] feat(les): add resident OpenAI API with SWA cache
+ validation
+
+---
+ tools/les-openai-bridge/NATIVE_REPORT.md  | 53 +++++++++++++++++++++
+ tools/les-openai-bridge/README.md         | 30 ++++++++++++
+ tools/les-openai-bridge/native_server.cpp | 58 +++++++++++++++++++++++
+ tools/server/CMakeLists.txt               | 15 ++++++
+ 4 files changed, 156 insertions(+)
+ create mode 100644 tools/les-openai-bridge/NATIVE_REPORT.md
+ create mode 100644 tools/les-openai-bridge/native_server.cpp
+
+diff --git a/tools/les-openai-bridge/NATIVE_REPORT.md b/tools/les-openai-bridge/NATIVE_REPORT.md
+new file mode 100644
+index 0000000..29d7231
+--- /dev/null
++++ b/tools/les-openai-bridge/NATIVE_REPORT.md
+@@ -0,0 +1,53 @@
++# Resident MiniCPM-V 4.7 35B-A3B LES server — M4 16 GB validation
++
++Date: 2026-10-14. Local-only worktree: `fix/les-openai-server`. Underlying LES `ios-omni` base: `96bbf61`.
++
++## Scope and implementation
++
++- Native C++ target: `llama-les-native-server`, optional `-DLLAMA_BUILD_LES_NATIVE_SERVER=ON` (default OFF).
++- Uses the fork's **current** `server_context`, `server_routes`, `server_http_context`; never modifies the LES backend, expert layout, models or their top-8 routing.
++- Routes exposed on loopback: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /completion`, `POST /tokenize`, `GET /props`.
++- Model weight load once per native server process. Port tested `127.0.0.1:18793`; `--host 0.0.0.0` rejected **before loading weights**, process exit 2. Not externally authenticated.
++- Native CLI build on local Apple M4 Metal: **PASS**. Plain chat: HTTP 200. `tool_choice=required` produced a proper `message.tool_calls` object (run_tests), HTTP 200; initial tool request 273 prompt tokens, ~47.22 seconds without shared task prefix.
++
++## Cache mode
++
++Recommended tested config:
++
++```text
++--moe-slot-bank 128 -c 4096 -b 64 -ub 16 -ngl all -t 4 --parallel 1
++--reasoning off --reasoning-format none --jinja --swa-full --cache-prompt
++LLAMA_MOE_LOOKAHEAD_PREFETCH=0
++```
++
++SWA-full matters for this MoE hybrid context: without it the resident server emitted warnings about insufficient cache state and forced full prompt reprocessing. **After enabling `--swa-full`**, an *identical* 124-token chat request was 15.08 s (cached 0) and then 0.57 s (cached 107). These are successive cold/warm samples, NOT a scientifically controlled LES/SWA A/B comparison.
++
++## Real coding-agent workflow (native API + host-executed tools)
++
++- Sandbox: disposable copy of `agent-bench/tasks/session`.
++- Server's actual OpenAI-compatible `tool_calls`; host validates paths and only edits sandbox `source.py`.
++- Tool sequence: run_tests -> read_file -> read_file -> replace_text -> run_tests -> final.
++- Result: real edit to SessionRegistry.revoke, 6/6 independent unittest **PASS**. No code outside the sandbox was modified.
++- Total: **362.4 sec**, 6 model turns, 5 real tool calls. Cumulative swap **not observed increasing** (approx. 297.38 MB already in use). Not a measurement of all Metal/unified memory.
++
++| Assistant turn | HTTP request time | Prompt tokens | Cached tokens | Action |
++|---|---:|---:|---:|---|
++| 0 | 87.15 s | 531 | 0 | run_tests (initial failure) |
++| 1 | 62.64 s | 882 | 494 | read_file |
++| 2 | 35.79 s | 1,026 | 862 | read_file |
++| 3 | 113.91 s | see JSON log | 862 | replace_text, applied |
++| 4 | 43.05 s | see JSON log | 1,279 | run_tests, 6/6 PASS |
++| 5 | 19.04 s | see JSON log | 1,542 | final summary |
++
++- Previous Python **process-per-turn** bridge session example: 555.3 sec, six turns, five calls but included a rejected tool call; tool trajectory differs. ~35% smaller wall clock **is illustrative, not strict apples-to-apples speedup**.
++- Agent source of truth: `/Volumes/ssd/les-eval/agent-bench/real_agent_native_session.json`; log: `real_agent_native_session_swa.log`.
++- Repeated-prefix cache artifacts: `cache_swa_full_1.json`, `cache_swa_full_2.json`; native smoke tests: `native_plain.json`, `native_tool.json`.
++- Native persistent server log: `native-swa-full.log`, includes restored context checkpoints.
++
++## Known limitations / next optimizations
++
++1. Hybrid/SWA model still has costly new-token prefill and SSD expert I/O; agent took minutes. `--swa-full` does NOT make every growing history an exact cache hit. Try normalized, shorter tool definitions and more compact tool results; benchmark one factor at a time.
++2. Current `--reasoning-format none` leaves literal empty `<think>` tags in content for short replies, though native tool call parsing was correct. Avoid treating the endpoint as fully spec-compliant without more request/streaming/error tests.
++3. Context capacity in real agent test was 4,096; 8K/16K native persistent context and sustained concurrency on this 16GB Mac were not tested. Monitor memory pressure and swap before raising.
++4. Native server has a minimal route set and no external auth, TLS, sandboxed tools or graceful admin shutdown. Keep it strictly loopback and use an allowlisted host agent to execute tool calls.
++5. Cache timing is affected by SSD/macOS page cache and the workload. For a high-frequency **text-only Coding Agent** on this same M4, the previously benchmarked Qwen REAP48 remains the more pragmatic default; MiniCPM 35B is interesting for multimodal capability and split-expert inference.
+diff --git a/tools/les-openai-bridge/README.md b/tools/les-openai-bridge/README.md
+index 9926847..a681fa7 100644
+--- a/tools/les-openai-bridge/README.md
++++ b/tools/les-openai-bridge/README.md
+@@ -23,3 +23,33 @@ argument names and required fields before forwarding the OpenAI-style tool call.
+ Local reproducibility experiment: `/Volumes/ssd/les-eval/agent-bench/real_tool_loop.py`.
+ It can run only `run_tests`, `read_file`, and `replace_text` on disposable copies of
+ `tasks/{session,stock,intervals}`. Every edit is restricted to `source.py`.
++
++## Native resident LES server (preferred, experimental)
++
++The optional native HTTP target reuses the current `server_context` and `server_http_context` APIs instead of the old incompatible `tools/server/server.cpp`:
++
++```bash
++cmake -S . -B /Volumes/ssd/les-eval/build \
++  -DGGML_METAL=ON -DGGML_ACCELERATE=ON \
++  -DLLAMA_BUILD_LES_NATIVE_SERVER=ON
++cmake --build /Volumes/ssd/les-eval/build --target llama-les-native-server -j 4
++
++LLAMA_MOE_LOOKAHEAD_PREFETCH=0 \
++/Volumes/ssd/les-eval/build/bin/llama-les-native-server \
++  -m /Volumes/ssd/les-eval/models/35B-A3B/MiniCPM-V-4_7-35B-A3B-mix_q3gud_im-les.gguf \
++  --moe-experts /Volumes/ssd/les-eval/models/35B-A3B/experts \
++  --moe-slot-bank 128 -c 4096 -b 64 -ub 16 -ngl all -t 4 \
++  --host 127.0.0.1 --port 18793 --parallel 1 \
++  --jinja --reasoning off --reasoning-format none \
++  --swa-full --cache-prompt
++```
++
++- `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (native OpenAI tool calls, including `tool_choice=required`), `POST /completion`, `POST /tokenize`, and `GET /props` are registered.
++- The backend and weights stay resident; unlike the Python bridge, it can reuse KV context between calls.
++- **Important:** this hybrid/SWA model did not retain reusable prompt KV without `--swa-full`. An identical 124-token request repeated with `--swa-full` showed `cached_tokens` 0 → 107 and duration 15.08s → 0.57s. This is an exact-repeat cache test, **not** an estimate of real Agent latency or end-to-end quality.
++- `--swa-full` increases KV memory requirements. Start with one server slot and 4096 context on 16GB; monitor swap and memory pressure when scaling context.
++- The current model/chat template may include literal `<think>...</think>` tags in `message.content` when using `--reasoning-format none`; consumers should account for that when showing responses.
++- The optional native target is loopback-only. Do not expose to the public network without adding authentication, resource limits and hardening.
++- The native frontend CMake target links the existing UI support library, which may trigger first-time frontend asset provisioning during a clean build.
++
++Native measurements live in `/Volumes/ssd/les-eval/agent-bench/native_*.json` and `native-swa-full.log`; do not mix them with the legacy process-per-turn bridge measurements.
+diff --git a/tools/les-openai-bridge/native_server.cpp b/tools/les-openai-bridge/native_server.cpp
+new file mode 100644
+index 0000000..abc261e
+--- /dev/null
++++ b/tools/les-openai-bridge/native_server.cpp
+@@ -0,0 +1,58 @@
++// Minimal resident LES-compatible HTTP API using the current server-context.
++// Does not depend on the obsolete tools/server/server.cpp or its utils.hpp.
++#include "arg.h"
++#include "common.h"
++#include "llama.h"
++#include "server-context.h"
++#include "server-http.h"
++#include "log.h"
++#include <cstdio>
++#include <memory>
++#include <string>
++
++int main(int argc, char ** argv) {
++    common_params params;
++    common_init();
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
++        return 1;
++    }
++    // This is a prototype which can invoke large local models: never bind publicly.
++    if (params.hostname != "127.0.0.1" && params.hostname != "localhost" && params.hostname != "::1") {
++        std::fprintf(stderr, "LES native server permits loopback host only (use --host 127.0.0.1)\n");
++        return 2;
++    }
++
++    llama_backend_init();
++    llama_numa_init(params.numa);
++
++    server_context ctx_server;
++    if (!ctx_server.load_model(params)) {
++        std::fprintf(stderr, "LES native server could not load model\n");
++        return 3;
++    }
++    server_routes routes(params, ctx_server);
++    routes.update_meta(ctx_server);
++    server_http_context http;
++    if (!http.init(params)) {
++        return 4;
++    }
++    http.get("/health", routes.get_health);
++    http.get("/v1/models", routes.get_models);
++    http.post("/v1/chat/completions", routes.post_chat_completions);
++    http.post("/completion", routes.post_completions);
++    http.post("/tokenize", routes.post_tokenize);
++    http.get("/props", routes.get_props);
++
++    if (!http.start()) {
++        return 5;
++    }
++    http.is_ready = true;
++    std::fprintf(stderr, "LES_NATIVE_READY %s\n", http.listening_address.c_str());
++    ctx_server.start_loop();
++    http.is_ready = false;
++    http.stop();
++    if (http.thread.joinable()) {
++        http.thread.join();
++    }
++    return 0;
++}
+diff --git a/tools/server/CMakeLists.txt b/tools/server/CMakeLists.txt
+index 7b4d40d..23c0b1b 100644
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -29,6 +29,21 @@ target_include_directories(${TARGET} PRIVATE ../omni/voxcpm2)
+ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
+ target_link_libraries(${TARGET} PRIVATE llama-common omni mtmd voxcpm2_runtime ${CMAKE_THREAD_LIBS_INIT})
+ 
++# Resident LES HTTP bridge using current server_context (not obsolete server.cpp).
++option(LLAMA_BUILD_LES_NATIVE_SERVER "Build minimal resident LES OpenAI-compatible HTTP server" OFF)
++if (LLAMA_BUILD_LES_NATIVE_SERVER)
++    add_executable(llama-les-native-server
++        ../les-openai-bridge/native_server.cpp
++        server-http.cpp
++        server-http.h
++    )
++    target_compile_features(llama-les-native-server PRIVATE cxx_std_17)
++    target_include_directories(llama-les-native-server PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR} ../mtmd ${CMAKE_SOURCE_DIR}/vendor)
++    target_link_libraries(llama-les-native-server PRIVATE
++        server-context llama-common llama-ui cpp-httplib omni mtmd ${CMAKE_THREAD_LIBS_INIT})
++endif()
++
+ # llama-omni-server executable (standalone omni HTTP API)
+ 
+ if (LLAMA_OPENSSL)
+-- 
+2.49.0
+
