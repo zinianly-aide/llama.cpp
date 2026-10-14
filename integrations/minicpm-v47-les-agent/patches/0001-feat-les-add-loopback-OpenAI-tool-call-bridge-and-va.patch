@@ -1,0 +1,372 @@
+From a46df61a0edd04f66b510c7a2c4c6901696e6017 Mon Sep 17 00:00:00 2001
+From: GitHub Bot <bot@example.com>
+Date: Wed, 14 Oct 2026 00:53:03 +0800
+Subject: [PATCH 1/3] feat(les): add loopback OpenAI tool-call bridge and
+ validation
+
+---
+ tools/les-openai-bridge/INTEGRATION_REPORT.md |  39 +++
+ tools/les-openai-bridge/README.md             |  25 ++
+ tools/les-openai-bridge/server.py             | 223 ++++++++++++++++++
+ tools/les-openai-bridge/test_server.py        |  41 ++++
+ 4 files changed, 328 insertions(+)
+ create mode 100644 tools/les-openai-bridge/INTEGRATION_REPORT.md
+ create mode 100644 tools/les-openai-bridge/README.md
+ create mode 100644 tools/les-openai-bridge/server.py
+ create mode 100644 tools/les-openai-bridge/test_server.py
+
+diff --git a/tools/les-openai-bridge/INTEGRATION_REPORT.md b/tools/les-openai-bridge/INTEGRATION_REPORT.md
+new file mode 100644
+index 0000000..1b691a3
+--- /dev/null
++++ b/tools/les-openai-bridge/INTEGRATION_REPORT.md
+@@ -0,0 +1,39 @@
++# MiniCPM-V 4.7 35B-A3B LES OpenAI-compatible bridge validation
++
++Date: 2026-10-14, Apple M4 Mac mini 16 GB, macOS, local loopback only.
++
++## Runtime setup
++
++- Upstream runtime: `tc-mb/llama.cpp-omni`, branch `ios-omni`, original source HEAD `96bbf61`.
++- Engine: independently compiled Metal `llama-cli`, split GGUF full 256 routed experts, top-8, bank 128, ubatch 16, context 4096, LES prefetch off, decoder window off.
++- API: Python standard-library local bridge, listening only on `127.0.0.1:18792`.
++- Supported endpoints: GET `/health`, GET `/v1/models`, POST `/v1/chat/completions` (`stream:false`), one function call/response per HTTP request.
++- Tools executed by **separate allowlisted host test harness**, never by bridge.
++
++## Validation
++
++- HTTP /health and /v1/models: PASS.
++- Single completion with `tool_choice=required`: HTTP 200, native OpenAI-style `message.tool_calls` with `run_tests` arguments `{}`, ~27 seconds.
++- Multi-turn agent test from `agent-bench/real_tool_loop.py`: **PASS** in 555.3 seconds, six assistant turns, five true tool calls.
++- Tool sequence: `run_tests` (initial failure) -> `read_file(source.py)` -> `replace_text` (model emitted flat top-level args; old adapter forwarded `{}` and host safely rejected) -> `replace_text` (model recovered with nested arguments; host applied) -> `run_tests` (6/6 PASS), followed by assistant final success summary.
++- Independently verified final sandbox tests: **6/6 PASS**.
++- Local bridge unit tests: **8/8 PASS** including both nested/flat tool arguments, parser behavior and enum rejection.
++- Observed macOS swap: ~301.69 MB already allocated before benchmark; **no increase observed**, not a claim of 0 system swap.
++
++## Implementation notes
++
++1. `server.py` provides limited OpenAI-style response shape, with strict host binding and serial request handling; it does not invoke tools itself.
++2. Parser recognizes both `{"tool":"x","arguments":{...}}` and `{"tool":"x","path":"...",...}` emitted by the model. Corrected compatibility code was unit tested **after** the successful agent run; the original run demonstrated model recovery from the old adapter's rejection.
++3. The `ios-omni` branch has `tools/server/server.cpp`, but its legacy `utils.hpp` references removed types (`common_remote_params`, `thinking_forced_open`); a native server was **not** completed. The exploratory CMake change was reverted.
++4. Every turn launches a new `llama-cli` process, re-encodes full message transcript, no persistent KV cache, no true streaming, no token accounting. The six-turn wall time is therefore a bridge upper-bound and **not** a benchmark of a native resident server.
++5. The text inference is functional for coding; this integration test did not validate image handling or all OpenAI request variants.
++
++## Evidence and next steps
++
++- Detailed tool logs: `/Volumes/ssd/les-eval/agent-bench/real_agent_session.json`
++- Patched sandbox: `/Volumes/ssd/les-eval/agent-bench/real-agent-sandboxes/session/`
++- API response: `/Volumes/ssd/les-eval/agent-bench/api_smoke.json`
++- API logs: `/Volumes/ssd/les-eval/agent-bench/bridge.log`
++- Test fixture: `/Volumes/ssd/les-eval/agent-bench/tasks/session/`
++
++Next: native resident OpenAI server using current `server-context`, so weights and KV context survive tool calls; then agent task suite over multiple seeds, long context and parameter A/B. Do **not** compare ~555s process-per-turn directly with Qwen persistent llama-server results as equal-engine inference performance.
+diff --git a/tools/les-openai-bridge/README.md b/tools/les-openai-bridge/README.md
+new file mode 100644
+index 0000000..9926847
+--- /dev/null
++++ b/tools/les-openai-bridge/README.md
+@@ -0,0 +1,25 @@
++# Local OpenAI-compatible API for split-LES inference (experimental)
++
++Run from the Mac with the matching `llama.cpp-omni` `llama-cli` and split GGUF weights:
++
++```bash
++python3 tools/les-openai-bridge/server.py --host 127.0.0.1 --port 18792 \
++  --bank 128 --ubatch 16 --depth 0 --context 4096
++```
++
++Routes: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (nonstreaming). Supports a restricted OpenAI-style `tools` request with one model-generated function call or final answer per turn. Host executes tools; **server never executes tool calls**. Only loopback is permitted. Runtime model weights and binary arguments default to `/Volumes/ssd/les-eval/` and may be overridden.
++
++**Limitations:** every chat completion launches a fresh `llama-cli` process and rebuilds its KV state from the request's message transcript; no prompt cache, batching or streaming. Usage tokens are reported as zero because this prototype does not instrument the tokenizer; clients must not use them for accounting. CLI-generated tool calls are best-effort prompt-format JSON (not a fine-tuned function calling protocol). No multimodal request body is supported. This is intended for validation only, not deployment as a network API.
++
++```bash
++python3 -m unittest discover -s tools/les-openai-bridge -p 'test_*.py'
++curl --noproxy '*' http://127.0.0.1:18792/health
++```
++
++The adapter accepts both `{"tool":"replace_text","arguments":{"path":"source.py",...}}`
++and a model-produced flat format `{"tool":"replace_text","path":"source.py",...}`. It validates
++argument names and required fields before forwarding the OpenAI-style tool call.
++
++Local reproducibility experiment: `/Volumes/ssd/les-eval/agent-bench/real_tool_loop.py`.
++It can run only `run_tests`, `read_file`, and `replace_text` on disposable copies of
++`tasks/{session,stock,intervals}`. Every edit is restricted to `source.py`.
+diff --git a/tools/les-openai-bridge/server.py b/tools/les-openai-bridge/server.py
+new file mode 100644
+index 0000000..99ea008
+--- /dev/null
++++ b/tools/les-openai-bridge/server.py
+@@ -0,0 +1,223 @@
++#!/usr/bin/env python3
++"""Local-only OpenAI chat/tool adapter for llama.cpp-omni LES llama-cli.
++
++This is intentionally a *process-per-turn* compatibility bridge. No native
++KV reuse, streaming, multimodal prompts, or tool execution inside the bridge.
++"""
++from __future__ import annotations
++import argparse
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++import json
++import logging
++import os
++from pathlib import Path
++import re
++import subprocess
++import threading
++import time
++import uuid
++
++LOG = logging.getLogger('les-openai-bridge')
++STOP = threading.BoundedSemaphore(1)
++MAX_BODY = 1_048_576
++MAX_TURNS = 18
++MAX_TEXT = 28000
++
++
++def extract_json(s: str):
++    # The model may wrap a JSON tool action in a fenced code block.
++    dec = json.JSONDecoder()
++    for m in re.finditer(r'\{', s):
++        try:
++            obj, _ = dec.raw_decode(s[m.start():])
++        except json.JSONDecodeError:
++            continue
++        if isinstance(obj, dict) and ('tool' in obj or 'final' in obj):
++            return obj
++    return None
++
++
++def normalize_tool_arguments(action: dict, tool_declaration: dict) -> dict:
++    """Accept both {tool,arguments:{...}} and {tool,path,old,new} shapes.
++
++    Validate field names, required properties and basic scalar types before
++    serializing a tool call; executing and path restriction are host duties.
++    """
++    fields=tool_declaration.get('function',{}).get('parameters',{})
++    args=action.get('arguments',action.get('args'))
++    if isinstance(args,str):
++        args=json.loads(args)
++    if args is None or (args=={} and any(k not in ('tool','final','arguments','args') for k in action)):
++        args={k:v for k,v in action.items() if k not in ('tool','final','arguments','args')}
++    if not isinstance(args,dict):raise ValueError('tool args must be JSON object')
++    props=fields.get('properties',{})
++    if fields.get('additionalProperties') is False and any(k not in props for k in args):
++        raise ValueError('undeclared tool argument')
++    if any(k not in args for k in fields.get('required',[])):
++        raise ValueError('missing required tool argument')
++    for key,value in args.items():
++        rule=props.get(key,{})
++        if rule.get('type')=='string' and not isinstance(value,str):raise ValueError(f'{key} must be string')
++        if rule.get('type')=='string' and len(value)>10000:raise ValueError(f'{key} value too large')
++        if 'enum' in rule and value not in rule['enum']:raise ValueError(f'{key} not in enum')
++    return args
++
++
++def result_text(stdout: str, marker: str) -> str:
++    # llama-cli emits a welcome banner, and may echo the source prompt.
++    pos = stdout.rfind(marker)
++    if pos >= 0:
++        rest = stdout[pos + len(marker):]
++    else:
++        # The current llama-cli abbreviates long prompt echoes with
++        # ` ... (truncated)`, removing any marker near the end of prompt.
++        sep = ' ... (truncated)\n\n'
++        if sep in stdout:
++            rest = stdout.split(sep, 1)[1]
++        else:
++            # Short prompt echo has no truncation; split from its blank line.
++            begin = stdout.rfind('\n> ')
++            if begin < 0: raise ValueError('Missing llama-cli prompt echo')
++            end = stdout.find('\n\n',begin)
++            if end < 0: raise ValueError('Cannot separate llama-cli prompt and response')
++            rest = stdout[end+2:]
++    rest = re.split(r'\[ Prompt:\s*\d', rest, maxsplit=1)[0]
++    rest = rest.rsplit('\nExiting...', 1)[0]
++    return rest.strip()
++
++
++def render_prompt(messages: list, tools: list, tool_choice) -> str:
++    names = {t.get('function', {}).get('name') for t in tools if isinstance(t, dict)}
++    forced = tool_choice.get('function', {}).get('name') if isinstance(tool_choice, dict) else None
++    intro = (
++        'You are a careful coding agent. The external host provides tools; you may ONLY request a tool, never pretend to run one. '
++        'Each response is EXACTLY ONE JSON object, with no Markdown. '
++        'For a tool call, respond {"tool":"name","arguments":{...}}; '
++        'for the final answer, respond {"final":"short explanation"}. '
++        'Use tools to inspect files and run tests before declaring success. '
++        'A failed test requires more tool use. Do not invent results.\n'
++    )
++    if tool_choice == 'required': intro += 'You MUST call one tool now; do not respond with final.\n'
++    if forced: intro += f'You MUST call tool {forced} now.\n'
++    if tool_choice == 'none': intro += 'Do not call any tool for this response; explain what you can answer.\n'
++    definitions = []
++    for t in tools:
++        f = t.get('function', {})
++        n = f.get('name', '')
++        if n and n in names:
++            definitions.append({'name': n, 'description':f.get('description',''), 'parameters': f.get('parameters',{})})
++    intro += 'Available tool signatures (JSON): '+json.dumps(definitions,ensure_ascii=False)+'\n'
++    chunks=[intro]
++    for m in messages[-MAX_TURNS:]:
++        role=m.get('role','user')
++        if role == 'tool':
++            chunks.append('TOOL_RESULT '+str(m.get('name',''))+': '+str(m.get('content',''))[:MAX_TEXT])
++        elif role == 'assistant' and m.get('tool_calls'):
++            for call in m['tool_calls']:
++                fn=call.get('function',{})
++                chunks.append('ASSISTANT_REQUESTED_TOOL '+str(fn.get('name',''))+' '+str(fn.get('arguments','')))
++        else:
++            content=m.get('content') or ''
++            if isinstance(content,list):
++                content=' '.join(str(x.get('text','')) for x in content if isinstance(x,dict) and x.get('type')=='text')
++            chunks.append(role.upper()+': '+str(content)[:MAX_TEXT])
++    chunks.append('ASSISTANT ACTION (one JSON object):\n')
++    return '\n\n'.join(chunks)
++
++
++class Handler(BaseHTTPRequestHandler):
++    server_version = 'LesOpenAICompat/0.1'
++    def log_message(self, fmt, *args): LOG.info('%s '+fmt, self.address_string(), *args)
++    def send(self, status, obj):
++        raw=json.dumps(obj,ensure_ascii=False).encode('utf-8')
++        self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8')
++        self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw)
++    def do_GET(self):
++        if self.path == '/health': self.send(200,{'status':'ok','mode':'process-per-turn'}); return
++        if self.path == '/v1/models':
++            self.send(200,{'object':'list','data':[{'id':self.server.model_name,'object':'model','owned_by':'local-les'}]});return
++        self.send(404,{'error':{'message':'not found'}})
++    def do_POST(self):
++        if self.path != '/v1/chat/completions':
++            self.send(404,{'error':{'message':'not found'}});return
++        try:
++            length=int(self.headers.get('Content-Length','0'))
++            if length<1 or length>MAX_BODY: self.send(413,{'error':{'message':'request too large'}});return
++            req=json.loads(self.rfile.read(length))
++            if req.get('stream'): self.send(400,{'error':{'message':'streaming unsupported by process-per-turn bridge'}});return
++            messages=req['messages']
++            if not isinstance(messages,list) or len(messages)>200: raise ValueError('messages must be a list of <=200 turns')
++            tools=req.get('tools') or []
++            if not isinstance(tools,list) or len(tools)>20: raise ValueError('tools must be <=20 function declarations')
++            choice=req.get('tool_choice','auto')
++            prompt=render_prompt(messages,tools,choice)
++            if len(prompt)>40000: raise ValueError('prompt too long for the tested context')
++            if not STOP.acquire(blocking=False):self.send(503,{'error':{'message':'model busy'}});return
++            try: response=self.server.infer(prompt,req)
++            finally:STOP.release()
++            obj=extract_json(response)
++            finish='stop'; content=response; calls=None
++            if tools and choice != 'none' and obj and obj.get('tool'):
++                name=obj['tool']; valid={t.get('function',{}).get('name') for t in tools}
++                if name not in valid: raise ValueError('model requested undeclared tool: '+str(name))
++                if isinstance(choice,dict) and choice.get('function',{}).get('name')!=name: raise ValueError('wrong forced tool')
++                declaration=next(t for t in tools if t.get('function',{}).get('name')==name)
++                args=normalize_tool_arguments(obj,declaration)
++                calls=[{'id':'call_'+uuid.uuid4().hex[:16],'type':'function','function':{'name':name,'arguments':json.dumps(args,ensure_ascii=False)}}]
++                content=None;finish='tool_calls'
++            elif obj and 'final' in obj:content=str(obj['final'])
++            elif tools and choice in ('required',) or (isinstance(choice,dict) and not calls):
++                raise ValueError('model did not emit required tool call')
++            self.send(200,{'id':'chatcmpl-'+uuid.uuid4().hex[:16], 'object':'chat.completion', 'created':int(time.time()), 'model':self.server.model_name,
++                'choices':[{'index':0,'message':{'role':'assistant','content':content,**({'tool_calls':calls} if calls else {})},'finish_reason':finish}],
++                'usage':{'prompt_tokens':0,'completion_tokens':0,'total_tokens':0}})
++        except (ValueError,KeyError,json.JSONDecodeError) as e: self.send(422,{'error':{'message':str(e)}})
++        except subprocess.TimeoutExpired:self.send(504,{'error':{'message':'local model inference timeout'}})
++        except Exception as e:LOG.exception('request failed');self.send(500,{'error':{'message':str(e)}})
++
++
++class Server(ThreadingHTTPServer):
++    def __init__(self,addr,config):
++        super().__init__(addr,Handler)
++        self.config=config
++        self.model_name='minicpm-v47-35b-a3b-les'
++    def infer(self,prompt,req):
++        a=self.config
++        marker='<<<LES_ASSISTANT_OUTPUT_'+uuid.uuid4().hex+'>>>'
++        argv=[a.cli,'-m',a.model,'--moe-experts',a.experts,'--moe-slot-bank',str(a.bank),'-c',str(a.context),
++            '-b','64','-ub',str(a.ubatch),'-ngl','all','-t','4','--no-warmup','-st',
++            '-n',str(min(max(int(req.get('max_tokens',384)),64),768)),'--temp',str(req.get('temperature',0)),
++            '--reasoning','off','--no-display-prompt','--simple-io','-p',prompt+marker]
++        env=os.environ.copy();env['LLAMA_MOE_LOOKAHEAD_PREFETCH']='1' if a.depth>0 else '0';env['LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH']=str(a.depth)
++        env.pop('LLAMA_MOE_DECODE_WINDOW',None)
++        p=subprocess.run(argv,env=env,stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=a.timeout)
++        if p.returncode: raise ValueError('inference failed rc='+str(p.returncode)+'; '+p.stderr[-700:])
++        LOG.info('inference completed in process mode, stdout=%d bytes',len(p.stdout))
++        if marker not in p.stdout:
++            LOG.debug('CLI abbreviated long prompt echo; stdout=%d bytes',len(p.stdout))
++        return result_text(p.stdout,marker)
++
++
++def main():
++    p=argparse.ArgumentParser()
++    p.add_argument('--host',default='127.0.0.1')
++    p.add_argument('--port',type=int,default=18792)
++    p.add_argument('--cli',default='/Volumes/ssd/les-eval/build/bin/llama-cli')
++    p.add_argument('--model',default='/Volumes/ssd/les-eval/models/35B-A3B/MiniCPM-V-4_7-35B-A3B-mix_q3gud_im-les.gguf')
++    p.add_argument('--experts',default='/Volumes/ssd/les-eval/models/35B-A3B/experts')
++    p.add_argument('--bank',type=int,default=128)
++    p.add_argument('--ubatch',type=int,default=16)
++    p.add_argument('--context',type=int,default=4096)
++    p.add_argument('--depth',type=int,default=0)
++    p.add_argument('--timeout',type=int,default=240)
++    a=p.parse_args()
++    if a.host not in ('127.0.0.1','localhost','::1'):p.error('loopback-only for prototype')
++    for f in (a.cli,a.model,a.experts):
++        if not Path(f).exists():p.error('missing '+f)
++    logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
++    srv=Server((a.host,a.port),a)
++    LOG.info('Listening on http://%s:%d (single inference at a time)',a.host,a.port)
++    try:srv.serve_forever()
++    finally:srv.server_close()
++
++if __name__=='__main__':main()
+diff --git a/tools/les-openai-bridge/test_server.py b/tools/les-openai-bridge/test_server.py
+new file mode 100644
+index 0000000..4f21085
+--- /dev/null
++++ b/tools/les-openai-bridge/test_server.py
+@@ -0,0 +1,41 @@
++import importlib.util
++from pathlib import Path
++import unittest
++
++p=Path(__file__).with_name('server.py')
++spec=importlib.util.spec_from_file_location('les_bridge',p)
++b=importlib.util.module_from_spec(spec)
++spec.loader.exec_module(b)
++
++class BridgeTests(unittest.TestCase):
++    def test_fenced_json(self):
++        x=b.extract_json('```json\n{"tool":"run_tests","arguments":{"path":"tests"}}\n```')
++        self.assertEqual(x['tool'],'run_tests')
++    def test_final(self):
++        self.assertEqual(b.extract_json('{"final":"done"}')['final'],'done')
++    def test_ignore_unrelated(self):
++        self.assertIsNone(b.extract_json('Hello { bad JSON}'))
++    def test_response_split(self):
++        out='Loading model\n> pretend prompt M_X\n{"tool":"read_file","arguments":{"path":"source.py"}}\n\n[ Prompt: 5.5 t/s | Generation: 3.5 t/s ]\nExiting...\n'
++        self.assertEqual(b.result_text(out,'M_X'),'{'+'"tool":"read_file","arguments":{"path":"source.py"}}')
++    def test_truncated_cli_echo(self):
++        output='Loading model...\n\n> User text\nAvailable tool  ... (truncated)\n\n{"tool":"run_tests","arguments":{}}\n\n[ Prompt: 10.2 t/s | Generation: 4.1 t/s ]\n\nExiting...\n'
++        self.assertEqual(b.result_text(output,'not-in-echo'),'{"tool":"run_tests","arguments":{}}')
++    def test_flat_tool_arguments(self):
++        schema={'function':{'parameters':{'type':'object','properties':{'path':{'type':'string','enum':['source.py']},'old':{'type':'string'},'new':{'type':'string'}},'required':['path','old','new'],'additionalProperties':False}}}
++        x=b.normalize_tool_arguments({'tool':'replace_text','path':'source.py','old':'a','new':'b'},schema)
++        self.assertEqual(x,{'path':'source.py','old':'a','new':'b'})
++        with self.assertRaises(ValueError):
++            b.normalize_tool_arguments({'tool':'replace_text','path':'../oops','old':'a','new':'b'},schema)
++    def test_nested_tool_arguments(self):
++        schema={'function':{'parameters':{'type':'object','properties':{'path':{'type':'string'}},'required':['path'],'additionalProperties':False}}}
++        self.assertEqual(b.normalize_tool_arguments({'tool':'read_file','arguments':{'path':'source.py'}},schema),{'path':'source.py'})
++    def test_render_tool_result(self):
++        t=[{'type':'function','function':{'name':'read_file','parameters':{'type':'object'}}}]
++        m=[{'role':'user','content':'Find a bug'}, {'role':'assistant','tool_calls':[{'function':{'name':'read_file','arguments':'{"path":"source.py"}'}}]}, {'role':'tool','name':'read_file','content':'def f(): pass'}]
++        s=b.render_prompt(m,t,'auto')
++        self.assertIn('TOOL_RESULT read_file:',s)
++        self.assertIn('def f(): pass',s)
++        self.assertIn('ASSISTANT_REQUESTED_TOOL read_file',s)
++
++if __name__=='__main__':unittest.main()
+-- 
+2.49.0
+

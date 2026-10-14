@@ -1,0 +1,343 @@
+From 63cbda3fd75ddb1e63cc6d4fbf736c5eab587b38 Mon Sep 17 00:00:00 2001
+From: GitHub Bot <bot@example.com>
+Date: Wed, 14 Oct 2026 19:44:06 +0800
+Subject: [PATCH 3/3] perf(agent): benchmark preflight bootstrap for resident
+ LES tools
+
+---
+ tools/les-openai-bridge/BOOTSTRAP_REPORT.md   |  49 ++++++
+ tools/les-openai-bridge/README.md             |  12 ++
+ .../bench_agent_bootstrap.py                  | 140 ++++++++++++++++++
+ .../fixtures/session/source.py                |  11 ++
+ .../fixtures/session/test_source.py           |  15 ++
+ tools/les-openai-bridge/test_bench_agent.py   |  55 +++++++
+ 6 files changed, 282 insertions(+)
+ create mode 100644 tools/les-openai-bridge/BOOTSTRAP_REPORT.md
+ create mode 100644 tools/les-openai-bridge/bench_agent_bootstrap.py
+ create mode 100644 tools/les-openai-bridge/fixtures/session/source.py
+ create mode 100644 tools/les-openai-bridge/fixtures/session/test_source.py
+ create mode 100644 tools/les-openai-bridge/test_bench_agent.py
+
+diff --git a/tools/les-openai-bridge/BOOTSTRAP_REPORT.md b/tools/les-openai-bridge/BOOTSTRAP_REPORT.md
+new file mode 100644
+index 0000000..37a19b0
+--- /dev/null
++++ b/tools/les-openai-bridge/BOOTSTRAP_REPORT.md
+@@ -0,0 +1,49 @@
++# M4 MiniCPM-V 4.7 35B-A3B LES Coding Agent: prompt / tool orchestration A/B
++
++Date: 2026-10-14; device: base Apple M4 Mac mini, 16GB unified memory; SSD split-expert model. Engine: native resident `llama-les-native-server`, 4K context, `bank=128`, `ubatch=16`, `--swa-full`, `--cache-prompt`, LES lookahead off, temperature=0. All experiments used the same original six-test `SessionRegistry` Python fixture and guarded source-only edits. Script runs and output evidence are local to `/Volumes/ssd/les-eval/agent-bench`.
++
++## Experiment and actual results
++
++| Run | Model turns | Model tool calls | Preflight host actions | Wall time | Tests |
++|---|---:|---:|---|---:|---|
++| Native baseline | 6 | 5 | none | **362.4 s** | 6/6 PASS |
++| Compact tool descriptions + brief unittest errors | 5 | 5 | none | **405.0 s** | 6/6 PASS |
++| **Bootstrap source/tests/failures before model inference** | **3** | **2** | trusted host executes 2 read_file equivalents + run_tests | **273.6 s** | **6/6 PASS** |
++
++All 3 runs successfully executed `replace_text`, validated the real code changes using independent unittest, and issued a final model response. The standalone bootstrap run performed model tool sequence `replace_text -> run_tests -> final` after the host-collected read-only observations. No existing development repository was changed by the tests.
++
++## Why simple compression did not help
++
++| Measurement | Baseline | Compact | Bootstrap |
++|---|---:|---:|---:|
++| Aggregate prompt tokens (across turns) | 6,901 | 4,902 | 3,256 |
++| Previously cached tokens | 5,039 | 3,043 | 1,999 |
++| **Uncached prompt tokens** | **1,862** | **1,859** | **1,257** |
++| Generated tokens | 412 | 488 | 337 |
++
++Compressing raw `unittest` failures from 1,356 to 113 characters preserved the test names and errors, but did **not** significantly reduce uncached tokens because the baseline heavily reused context. Bootstrapping reduces expensive model/host round trips and uncached tokens (~32.5% reduction); this is a stronger lever on an SSD streamed-expert model.
++
++Bootstrap HTTP turn timings: 209.25 s (869 prompt tokens, 0 cached, 280 generated; `replace_text`), 46.48 s (1,172 prompt, 849 cached; `run_tests`), 17.49 s (1,215 prompt, 1,150 cached; final). **Single runs under different OS SSD/file cache conditions:** the 24.5% lower observed wall time than baseline is preliminary, NOT a stable/statistically controlled speedup. Every run completed with HTTP tool semantics; no Swap increase was observed during checks (~289MB already allocated).
++
++## Repeatable script and safety
++
++`bench_agent_bootstrap.py` is a self-contained host-side demonstration that ships with an intentionally faulty `fixtures/session/source.py` and `test_source.py`. It copies these into `/Volumes/ssd/les-eval/agent-bench/real-agent-sandboxes/native-bootstrap_repro-session`, runs actual tests, returns read-only observations to the model, and applies only `replace_text` edits to the copied `source.py` after a fixture-specific AST validation gate. It persists detailed prompts, tools, usage, tests and timings under `/Volumes/ssd/les-eval/agent-bench/`. It **does not** modify an existing user repository.
++
++```bash
++cd /Volumes/ssd/les-eval/llama.cpp-omni-git
++# Precondition: native server on 127.0.0.1:18793, as documented in README
++/opt/homebrew/bin/python3 tools/les-openai-bridge/bench_agent_bootstrap.py session
++# Overrides:
++# LES_AGENT_API_URL=http://127.0.0.1:18793/v1/chat/completions
++# LES_AGENT_BENCH_DIR=/Volumes/ssd/les-eval/agent-bench
++```
++
++**Safety limitation:** a path-restricted tool fixture and AST allowlist are *not* an OS-level sandbox. It is unsafe to run arbitrary generated source from unknown repositories as local Python without real process / filesystem / network isolation. This script supports **only** the included `SessionRegistry` fixture, and the AST gate is deliberately restrictive.
++
++## Next engineering direction
++
++1. Keep the original native server config. Bootstrap is the best observed orchestration strategy, not a model-weights speedup.
++2. Repeat A/B on several tasks and multiple random/cache orders before claiming robust performance gains.
++3. Tune the initial context: providing the entire test file incurs up-front prefill; explore failure summary + source first, then fetching tests only when necessary.
++4. For general-purpose Coding Agents, implement proper OS sandbox and per-tool execution policies before using model-generated code on non-fixture repositories.
++5. Optimize the **new-context** prefill and decode path / SSD expert access, not just raw Prompt size.
+diff --git a/tools/les-openai-bridge/README.md b/tools/les-openai-bridge/README.md
+index a681fa7..c27985a 100644
+--- a/tools/les-openai-bridge/README.md
++++ b/tools/les-openai-bridge/README.md
+@@ -53,3 +53,15 @@ LLAMA_MOE_LOOKAHEAD_PREFETCH=0 \
+ - The native frontend CMake target links the existing UI support library, which may trigger first-time frontend asset provisioning during a clean build.
+ 
+ Native measurements live in `/Volumes/ssd/les-eval/agent-bench/native_*.json` and `native-swa-full.log`; do not mix them with the legacy process-per-turn bridge measurements.
++
++## Reproducible bootstrap coding-agent benchmark
++
++For the included `SessionRegistry` test fixture only, run:
++
++```bash
++cd /Volumes/ssd/les-eval/llama.cpp-omni-git
++/opt/homebrew/bin/python3 tools/les-openai-bridge/bench_agent_bootstrap.py session
++/opt/homebrew/bin/python3 -m unittest discover -s tools/les-openai-bridge -p 'test_*.py'
++```
++
++The benchmark performs read-only test/code preflight before the first model request, then lets the model call the real `replace_text` and `run_tests` tools. Run details and limitations: [BOOTSTRAP_REPORT.md](BOOTSTRAP_REPORT.md). **It is a controlled source-only test fixture, not a safe general-purpose Python execution sandbox.**
+diff --git a/tools/les-openai-bridge/bench_agent_bootstrap.py b/tools/les-openai-bridge/bench_agent_bootstrap.py
+new file mode 100644
+index 0000000..384d19d
+--- /dev/null
++++ b/tools/les-openai-bridge/bench_agent_bootstrap.py
+@@ -0,0 +1,140 @@
++#!/usr/bin/env python3
++"""Actual chat/completions tool_calls loop, mutations only in disposable sandbox."""
++from __future__ import annotations
++import json, pathlib, shutil, subprocess, sys, time, urllib.request, urllib.error, os
++SCRIPT_DIR=pathlib.Path(__file__).resolve().parent
++B=pathlib.Path(os.environ.get('LES_AGENT_BENCH_DIR','/Volumes/ssd/les-eval/agent-bench')).resolve()
++B.mkdir(parents=True,exist_ok=True)
++RUN='bootstrap_repro'
++import re
++TASK=sys.argv[1] if len(sys.argv)>1 else 'session'
++assert TASK == 'session', 'only the bundled SessionRegistry fixture is supported'
++TARGET=os.environ.get('LES_AGENT_TARGET','native')
++assert TARGET == 'native', 'bootstrap benchmark only validated against native API'
++ROOT=B/'real-agent-sandboxes'/f'{TARGET}-{RUN}-{TASK}'
++shutil.rmtree(ROOT,ignore_errors=True)
++shutil.copytree(SCRIPT_DIR/'fixtures'/TASK,ROOT)
++OUT=B/f'real_agent_{TARGET}_{RUN}_{TASK}.json'
++URL=os.environ.get('LES_AGENT_API_URL','http://127.0.0.1:'+('18793' if TARGET=='native' else '18792')+'/v1/chat/completions')
++PY='/opt/homebrew/bin/python3'
++TOOLS=[
++ {'type':'function','function':{'name':'run_tests','description':'Run tests. Return failing names and errors.','parameters':{'type':'object','properties':{},'additionalProperties':False}}},
++ {'type':'function','function':{'name':'read_file','description':'Read a sandbox file.','parameters':{'type':'object','properties':{'path':{'type':'string','enum':['source.py','test_source.py']}},'required':['path'],'additionalProperties':False}}},
++ {'type':'function','function':{'name':'replace_text','description':'Replace one exact substring of source.py. Tests are read-only.','parameters':{'type':'object','properties':{'path':{'type':'string','enum':['source.py']},'old':{'type':'string'},'new':{'type':'string'}},'required':['path','old','new'],'additionalProperties':False}}}
++]
++SYSTEM='The initial source, tests and actual failing test results are supplied below by the host. Repair source.py using replace_text; then call run_tests to verify all six pass. Do not edit tests. Do not claim success without run_tests PASS.'
++MESSAGES=[{'role':'system','content':SYSTEM},{'role':'user','content':'Fix all 6 tests. Use tools, verify with run_tests.'}]
++STEPS=[]
++start=time.monotonic()
++def test():
++    p=subprocess.run([PY,'-m','unittest','discover','-s',str(ROOT),'-p','test_source.py'],cwd=ROOT,capture_output=True,text=True,timeout=15)
++    return p.returncode,p.stderr[-3800:]
++
++def summarize_test_result(rc,detail):
++    # Keep the exact underlying unittest output on disk; only minimize the
++    # tool-visible response. Error summaries come from actual test tracebacks.
++    n=re.search(r'Ran (\d+) tests?',detail)
++    if rc==0:
++        return 'exit_code=0; Ran '+(n.group(1) if n else '?')+' tests; OK'
++    titles=re.findall(r'(?m)^(FAIL|ERROR): (\w+) ',detail)
++    errors=re.findall(r'(?m)^((?:AssertionError|ValueError|TypeError|KeyError|IndexError|AttributeError|RuntimeError):.*)$',detail)
++    lines=['exit_code='+str(rc),'Ran '+(n.group(1) if n else '?')+' tests']
++    for i,(category,name) in enumerate(titles):
++        lines.append(category+' '+name+': '+(errors[i] if i<len(errors) else 'failed; see full log'))
++    if not titles:
++        lines.append(detail[-700:])
++    return '\n'.join(lines)
++def validate_fixture_source(candidate):
++    # This is a defense-in-depth *fixture-specific* gate, NOT an OS sandbox.
++    # Generated source is later executed by unittest, so never apply this
++    # harness to untrusted user projects without a real isolated runtime.
++    import ast
++    tree=ast.parse(candidate)
++    if len(tree.body)!=1 or not isinstance(tree.body[0],ast.ClassDef) or tree.body[0].name!='SessionRegistry':
++        raise ValueError('only SessionRegistry is allowed in this fixture')
++    allowed_methods={'__init__','register','get','revoke'}
++    funcs=[n for n in tree.body[0].body if isinstance(n,ast.FunctionDef)]
++    if {f.name for f in funcs}!=allowed_methods or len(funcs)!=4 or len(tree.body[0].body)!=4:
++        raise ValueError('fixture methods changed')
++    unsafe=(ast.Import,ast.ImportFrom,ast.Global,ast.Nonlocal,ast.With,ast.AsyncWith,ast.Try,ast.Lambda,ast.AsyncFunctionDef,ast.Await,ast.Yield,ast.YieldFrom,ast.While,ast.For,ast.AsyncFor,ast.Delete)
++    for node in ast.walk(tree):
++        if isinstance(node,unsafe): raise ValueError('unsupported statement in generated fixture')
++        if isinstance(node,ast.Raise):
++            if not isinstance(node.exc,ast.Call) or not isinstance(node.exc.func,ast.Name) or node.exc.func.id!='ValueError':
++                raise ValueError('only ValueError is permitted')
++        if isinstance(node,ast.Attribute) and node.attr.startswith('__') and node.attr!='__init__':
++            raise ValueError('dunder attribute access forbidden')
++        if isinstance(node,ast.Call):
++            target=node.func
++            if isinstance(target,ast.Name):
++                if target.id!='ValueError':raise ValueError('function call not permitted: '+target.id)
++            elif isinstance(target,ast.Attribute):
++                if target.attr not in ('get','pop') or not isinstance(target.value,ast.Attribute) or target.value.attr!='_sessions':
++                    raise ValueError('only dict.get/pop calls allowed')
++            else:raise ValueError('dynamic calls not allowed')
++    return True
++
++def invoke(name,args):
++    if name=='run_tests':
++        rc,detail=test();(ROOT/'latest_full_test.log').write_text(detail);return summarize_test_result(rc,detail)
++    if name=='read_file':
++        f=args.get('path')
++        if f not in ('source.py','test_source.py'):raise ValueError('read path must be within sandbox')
++        return (ROOT/f).read_text()
++    if name=='replace_text':
++        if args.get('path')!='source.py':raise ValueError('can only edit source.py')
++        old,new=args.get('old'),args.get('new')
++        if not isinstance(old,str) or not isinstance(new,str) or not old or len(old)>5000 or len(new)>5000:raise ValueError('invalid replacement')
++        p=ROOT/'source.py';oldfile=p.read_text()
++        if oldfile.count(old)!=1:raise ValueError('replace_text old substring occurs '+str(oldfile.count(old))+' times')
++        candidate=oldfile.replace(old,new,1)
++        validate_fixture_source(candidate)
++        p.write_text(candidate);return 'APPLIED: source.py updated'
++    raise ValueError('tool not on allowlist')
++def persist(done=False,error=None):
++    rc,output=test()
++    record={'task':TASK,'elapsed_s':round(time.monotonic()-start,1),'turns':len(STEPS),
++      'tool_calls':[a['tool'] for s in STEPS for a in s.get('executions',[])],
++      'test_exit':rc,'test_pass':rc==0,'test_tail':output[-1300:],
++      'steps':STEPS,'complete':done,'error':error, 'target':TARGET, 'mode':RUN, 'bootstrap_tests_failed':bootstrap_rc!=0}
++    OUT.write_text(json.dumps(record,ensure_ascii=False,indent=2))
++    print('STATE',TASK,'turns',len(STEPS),'pass',rc==0,'tools',record['tool_calls'],'done',done,'error',error,flush=True)
++    return record
++# Preflight executes actual read/test actions in the isolated workspace. This
++# removes inference roundtrips for deterministic, read-only observations.
++bootstrap_rc,bootstrap_raw=test()
++(ROOT/'bootstrap_full_test.log').write_text(bootstrap_raw)
++assert bootstrap_rc!=0, 'fixture unexpectedly passes before model patch'
++boot='Host preflight (real sandbox tools executed):\n'+'read_file(source.py):\n'+(ROOT/'source.py').read_text()+\
++    '\nread_file(test_source.py):\n'+(ROOT/'test_source.py').read_text()+\
++    '\nrun_tests:\n'+summarize_test_result(bootstrap_rc,bootstrap_raw)+\
++    '\nThe above observations are real; now request the smallest working patch with replace_text, then call run_tests.'
++MESSAGES[1]['content']=boot
++opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
++for turn in range(9):
++    data={'model':('MiniCPM-V-4_7-35B-A3B-mix_q3gud_im-les.gguf' if TARGET=='native' else 'minicpm-v47-35b-a3b-les'),'messages':MESSAGES,'tools':TOOLS,
++          'tool_choice':'required' if turn==0 else 'auto','temperature':0,'max_tokens':280,'stream':False}
++    request=urllib.request.Request(URL,json.dumps(data,ensure_ascii=False).encode(),{'Content-Type':'application/json'})
++    request_started=time.monotonic()
++    try:
++        with opener.open(request,timeout=245) as r: obj=json.load(r)
++    except Exception as e:
++        response=e.read().decode()[:700] if isinstance(e,urllib.error.HTTPError) else str(e)
++        persist(error=f'HTTP request error: {response}');break
++    msg=obj['choices'][0]['message']; calls=msg.get('tool_calls',[])
++    step={'turn':turn,'request_s':round(time.monotonic()-request_started,2),'usage':obj.get('usage',{}),'finish_reason':obj['choices'][0]['finish_reason'],'assistant_content':msg.get('content'),'tool_calls':calls,'executions':[]}
++    STEPS.append(step)
++    if not calls:
++        persist(done=True);break
++    MESSAGES.append({'role':'assistant','content':msg.get('content'), 'tool_calls':calls})
++    for call in calls:
++        name=call['function']['name']
++        try:
++            args=json.loads(call['function']['arguments'])
++            result=invoke(name,args)
++        except Exception as e: result='TOOL_ERROR: '+repr(e)
++        step['executions'].append({'tool':name,'arguments':call['function']['arguments'],'result':result[:1500]})
++        MESSAGES.append({'role':'tool','tool_call_id':call['id'],'name':name,'content':result})
++    persist()
++else:
++    persist(error='turn limit reached')
+diff --git a/tools/les-openai-bridge/fixtures/session/source.py b/tools/les-openai-bridge/fixtures/session/source.py
+new file mode 100644
+index 0000000..40af932
+--- /dev/null
++++ b/tools/les-openai-bridge/fixtures/session/source.py
+@@ -0,0 +1,11 @@
++class SessionRegistry:
++    def __init__(self):
++        self._sessions = {}
++    def register(self, key, value):
++        if key in self._sessions:
++            raise ValueError('already registered')
++        self._sessions[key] = value
++    def get(self, key):
++        return self._sessions.get(key)
++    def revoke(self, key):
++        return self._sessions.get(key)
+diff --git a/tools/les-openai-bridge/fixtures/session/test_source.py b/tools/les-openai-bridge/fixtures/session/test_source.py
+new file mode 100644
+index 0000000..7509545
+--- /dev/null
++++ b/tools/les-openai-bridge/fixtures/session/test_source.py
+@@ -0,0 +1,15 @@
++import unittest
++from source import SessionRegistry
++class Tests(unittest.TestCase):
++    def test_a(self):
++        x=SessionRegistry(); x.register('a','A'); self.assertEqual(x.revoke('a'),'A'); self.assertIsNone(x.get('a'))
++    def test_b(self):
++        x=SessionRegistry(); self.assertIsNone(x.revoke('missing'))
++    def test_c(self):
++        x=SessionRegistry(); x.register('a',1); x.revoke('a'); x.register('a',2); self.assertEqual(x.get('a'),2)
++    def test_d(self):
++        x=SessionRegistry(); x.register('a',1)
++        with self.assertRaises(ValueError):x.register('a',2)
++    def test_e(self):
++        x=SessionRegistry(); x.register('a',1); x.register('b',2); x.revoke('a'); self.assertEqual(x.get('b'),2)
++    def test_f(self): self.assertIsNone(SessionRegistry().get('none'))
+diff --git a/tools/les-openai-bridge/test_bench_agent.py b/tools/les-openai-bridge/test_bench_agent.py
+new file mode 100644
+index 0000000..d2a7e56
+--- /dev/null
++++ b/tools/les-openai-bridge/test_bench_agent.py
+@@ -0,0 +1,55 @@
++"""Pure fixture/summary checks; this module never runs a model or touches user projects."""
++import ast
++from pathlib import Path
++import re
++import subprocess
++import unittest
++
++DIR = Path(__file__).parent
++MODULE = ast.parse((DIR / 'bench_agent_bootstrap.py').read_text())
++# Extract only pure functions because the experiment script intentionally runs
++# an agent when executed; importing it would invoke the model.
++FUNCTIONS = [x for x in MODULE.body if isinstance(x, ast.FunctionDef) and
++             x.name in {'validate_fixture_source','summarize_test_result'}]
++namespace = {'re': re}
++exec(compile(ast.Module(body=FUNCTIONS, type_ignores=[]), '<agent_fixture_checks>', 'exec'), namespace)
++
++class AgentFixtureTests(unittest.TestCase):
++    def setUp(self):
++        self.source=(DIR/'fixtures/session/source.py').read_text()
++        self.validate=namespace['validate_fixture_source']
++        self.summarize=namespace['summarize_test_result']
++
++    def test_original_and_fixed_fixture(self):
++        self.assertTrue(self.validate(self.source))
++        self.assertTrue(self.validate(self.source.replace(
++            '    def revoke(self, key):\n        return self._sessions.get(key)',
++            '    def revoke(self, key):\n        return self._sessions.pop(key, None)')))
++
++    def test_import_rejected(self):
++        with self.assertRaises(ValueError):self.validate(self.source+'\nimport os\n')
++
++    def test_file_write_rejected(self):
++        with self.assertRaises(ValueError):self.validate(self.source.replace(
++            'return self._sessions.get(key)', "return open('/tmp/not-allowed','w')"))
++
++    def test_method_removal_rejected(self):
++        with self.assertRaises(ValueError):self.validate(self.source.replace('    def revoke(self, key):','    def delete(self, key):'))
++
++    def test_unittest_failure_summary(self):
++        folder=DIR/'fixtures/session'
++        result=subprocess.run(['/opt/homebrew/bin/python3','-m','unittest','discover','-s',str(folder),'-p','test_source.py'],
++                              cwd=folder,capture_output=True,text=True,timeout=10)
++        self.assertNotEqual(result.returncode,0)
++        summary=self.summarize(result.returncode,result.stderr)
++        self.assertIn('ERROR test_c:',summary)
++        self.assertIn('FAIL test_a:',summary)
++        self.assertIn('ValueError: already registered',summary)
++        self.assertIn('AssertionError:',summary)
++        self.assertLess(len(summary),len(result.stderr)/3)
++
++    def test_success_summary(self):
++        self.assertEqual(self.summarize(0,'......\nRan 6 tests in 0.000s\nOK\n'),
++                         'exit_code=0; Ran 6 tests; OK')
++
++if __name__=='__main__':unittest.main()
+-- 
+2.49.0
+
